@@ -2804,6 +2804,35 @@ async function writeProfileToCloud(user){
     updatedAt:serverTimestamp()
   },{merge:true});
 }
+async function syncJournalNow(journalId){
+  const user=firebaseAuth.currentUser;
+  if(!user||!cloudReady||!journalId)return;
+  if(!navigator.onLine){
+    setCloudStatus("Offline","offline");
+    return;
+  }
+
+  const payload=journalCloudPayload(journalId);
+  const fingerprint=journalFingerprint(payload);
+  if(cloudFingerprints.get(journalId)===fingerprint){
+    setCloudStatus("Saved to cloud");
+    return;
+  }
+
+  setCloudStatus("Saving…");
+  try{
+    await setDoc(doc(firestoreDb,"users",user.uid,"journals",journalId),{
+      ...payload,
+      updatedAt:serverTimestamp()
+    },{merge:true});
+    cloudFingerprints.set(journalId,fingerprint);
+    setCloudStatus("Saved to cloud");
+  }catch(error){
+    console.error("Firestore journal save failed",error);
+    setCloudStatus(navigator.onLine?"Not saved":"Offline",navigator.onLine?"error":"offline");
+  }
+}
+
 async function syncAllChangedJournals(){
   const user=firebaseAuth.currentUser;
   if(!user||!cloudReady)return;
@@ -2814,7 +2843,6 @@ async function syncAllChangedJournals(){
 
   setCloudStatus("Saving…");
   try{
-    await writeProfileToCloud(user);
     const writes=[];
 
     JOURNALS.forEach(journal=>{
@@ -2839,11 +2867,30 @@ async function syncAllChangedJournals(){
     setCloudStatus(navigator.onLine?"Not saved":"Offline",navigator.onLine?"error":"offline");
   }
 }
-function scheduleCloudSync(delay=300){
+function currentJournalIdForSync(){
+  if(state.view==="intro"||state.view==="entry"||state.view==="coverEdit"){
+    return state.currentJournal||null;
+  }
+  return null;
+}
+function flushCurrentJournal(){
+  clearTimeout(cloudSyncTimer);
+  const journalId=currentJournalIdForSync();
+  return journalId?syncJournalNow(journalId):syncAllChangedJournals();
+}
+
+function scheduleCloudSync(delay=2000){
   if(!cloudReady||!firebaseAuth.currentUser)return;
   clearTimeout(cloudSyncTimer);
   setCloudStatus(navigator.onLine?"Saving…":"Offline",navigator.onLine?"":"offline");
-  cloudSyncTimer=setTimeout(syncAllChangedJournals,delay);
+  cloudSyncTimer=setTimeout(()=>{
+    const journalId=currentJournalIdForSync();
+    if(journalId){
+      syncJournalNow(journalId);
+    }else{
+      syncAllChangedJournals();
+    }
+  },delay);
 }
 function save(){
   saveLocalOnly();
@@ -3018,7 +3065,7 @@ async function applyFirebaseUser(user){
 async function signOutFirebase(){
   try{
     clearTimeout(cloudSyncTimer);
-    await syncAllChangedJournals();
+    await flushCurrentJournal();
     await signOut(firebaseAuth);
   }catch(error){
     console.error(error);
@@ -4734,6 +4781,19 @@ if(DEMO_MODE){
   });
 }
 
+document.addEventListener("focusout",event=>{
+  if(!isLoggedIn()||!cloudReady)return;
+  if(event.target.matches("textarea,input")){
+    flushCurrentJournal();
+  }
+});
+document.addEventListener("change",event=>{
+  if(!isLoggedIn()||!cloudReady)return;
+  if(event.target.matches("textarea,input,select")){
+    flushCurrentJournal();
+  }
+});
+
 window.addEventListener("offline",()=>{
   if(isLoggedIn())setCloudStatus("Offline","offline");
 });
@@ -4746,8 +4806,7 @@ window.addEventListener("online",()=>{
 document.addEventListener("visibilitychange",()=>{
   if(!isLoggedIn())return;
   if(document.visibilityState==="hidden"){
-    clearTimeout(cloudSyncTimer);
-    syncAllChangedJournals();
+    flushCurrentJournal();
   }
 });
 window.addEventListener("focus",async()=>{
