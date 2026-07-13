@@ -2523,9 +2523,9 @@ body.logged-in{background:#fff}
           </button>
         </div>
       </div>
-      <button class="save-top hidden save-home-btn" id="saveTop" aria-label="Save and return home">
+      <button class="save-top hidden save-home-btn" id="saveTop" aria-label="Save journal">
         <span class="save-home-content">Save</span>
-        <span class="save-home-tooltip" role="tooltip">Save your work and return home</span>
+        <span class="save-home-tooltip" role="tooltip">Save this journal to your account</span>
       </button>
 
       <span class="cloud-sync-status" id="cloudSyncStatus" aria-live="polite"></span>
@@ -2894,9 +2894,14 @@ function scheduleCloudSync(delay=2000){
 }
 function save(){
   saveLocalOnly();
-  scheduleCloudSync();
 }
-function touch(js){js.updatedAt=Date.now();js.complete=false;save()}
+function markJournalUnsaved(js){
+  js.updatedAt=Date.now();
+  js.complete=false;
+  saveLocalOnly();
+  if(isLoggedIn())setCloudStatus("Unsaved changes","offline");
+}
+function touch(js){markJournalUnsaved(js)}
 function esc(s=""){return String(s).replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]))}
 function escAttr(s=""){return esc(s)}
 function currentJournal(){return JOURNALS[state.currentIndex]}
@@ -3065,7 +3070,6 @@ async function applyFirebaseUser(user){
 async function signOutFirebase(){
   try{
     clearTimeout(cloudSyncTimer);
-    await flushCurrentJournal();
     await signOut(firebaseAuth);
   }catch(error){
     console.error(error);
@@ -3733,12 +3737,17 @@ function openJournal(index,bookElement=null){
 }
 
 
-function leaveCoverEdit(savePattern){
+async function leaveCoverEdit(savePattern){
   if(editClosing)return;
   editClosing=true;
 
   const j=currentJournal();
-  if(savePattern)state.patterns[j.id]=draftPattern;
+  if(savePattern){
+    state.patterns[j.id]=draftPattern;
+    state.journals[j.id].updatedAt=Date.now();
+    saveLocalOnly();
+    await syncJournalNow(j.id);
+  }
 
   const panel=document.querySelector(".pattern-drawer");
   if(panel)panel.classList.add("closing");
@@ -3747,7 +3756,7 @@ function leaveCoverEdit(savePattern){
     draftPattern=null;
     coverTransition="return";
     state.view="home";
-    save();
+    saveLocalOnly();
     render();
     editBookRect=null;
     editClosing=false;
@@ -3969,8 +3978,10 @@ function renderEntry(){
       button.classList.add("confirm-saving");
       js.complete=true;
       js.updatedAt=Date.now();
-      save();
-      setTimeout(openDownloadModal,560);
+      saveLocalOnly();
+      syncJournalNow(currentJournal().id).finally(()=>{
+        setTimeout(openDownloadModal,560);
+      });
     }else document.getElementById("completeError").classList.remove("hidden")
   }
 }
@@ -4763,7 +4774,23 @@ document.addEventListener("click",event=>{
     closeProfileMenu();
   }
 });
-saveTop.onclick=()=>{save();returnHomeWithBookAnimation(true)};
+saveTop.onclick=async()=>{
+  const journalId=currentJournal().id;
+  const content=saveTop.querySelector(".save-home-content");
+  saveTop.disabled=true;
+  saveTop.classList.add("saving");
+  if(content)content.textContent="Saving…";
+
+  saveLocalOnly();
+  await syncJournalNow(journalId);
+
+  if(content)content.textContent="Saved";
+  setTimeout(()=>{
+    if(content)content.textContent="Save";
+    saveTop.disabled=false;
+    saveTop.classList.remove("saving");
+  },1100);
+};
 window.addEventListener("keydown",e=>{if(e.key==="Escape"){closeModal();closeDrawer();closeProfileMenu()}});
 
 if(DEMO_MODE){
@@ -4781,77 +4808,11 @@ if(DEMO_MODE){
   });
 }
 
-document.addEventListener("focusout",event=>{
-  if(!isLoggedIn()||!cloudReady)return;
-  if(event.target.matches("textarea,input")){
-    flushCurrentJournal();
-  }
-});
-document.addEventListener("change",event=>{
-  if(!isLoggedIn()||!cloudReady)return;
-  if(event.target.matches("textarea,input,select")){
-    flushCurrentJournal();
-  }
-});
-
 window.addEventListener("offline",()=>{
   if(isLoggedIn())setCloudStatus("Offline","offline");
 });
 window.addEventListener("online",()=>{
-  if(isLoggedIn()){
-    setCloudStatus("Saving…");
-    scheduleCloudSync(100);
-  }
-});
-document.addEventListener("visibilitychange",()=>{
-  if(!isLoggedIn())return;
-  if(document.visibilityState==="hidden"){
-    flushCurrentJournal();
-  }
-});
-window.addEventListener("focus",async()=>{
-  const user=firebaseAuth.currentUser;
-  if(!user||!cloudReady||!navigator.onLine)return;
-  try{
-    const snapshot=await getDocsFromServer(collection(firestoreDb,"users",user.uid,"journals"));
-    let changed=false;
-    snapshot.forEach(documentSnapshot=>{
-      const data=documentSnapshot.data()||{};
-      const journalId=documentSnapshot.id;
-      if(!state.journals[journalId])return;
-
-      const remoteUpdated=Number(data.clientUpdatedAt)||0;
-      const localUpdated=Number(state.journals[journalId].updatedAt)||0;
-      if(remoteUpdated<=localUpdated)return;
-
-      state.journals[journalId]={
-        ...emptyJournal(),
-        introSeen:Boolean(data.introSeen),
-        question:data.question||"",
-        sources:Array.isArray(data.sources)?data.sources:[],
-        answer:data.answer||"",
-        complete:Boolean(data.complete),
-        updatedAt:remoteUpdated
-      };
-      if(data.pattern)state.patterns[journalId]=data.pattern;
-      cloudFingerprints.set(journalId,journalFingerprint({
-        introSeen:Boolean(data.introSeen),
-        question:data.question||"",
-        sources:Array.isArray(data.sources)?data.sources:[],
-        answer:data.answer||"",
-        complete:Boolean(data.complete),
-        pattern:data.pattern||state.patterns[journalId]
-      }));
-      changed=true;
-    });
-    if(changed){
-      saveLocalOnly();
-      render();
-      setCloudStatus("Updated");
-    }
-  }catch(error){
-    console.error("Firestore refresh failed",error);
-  }
+  if(isLoggedIn())setCloudStatus("Unsaved changes","offline");
 });
 
 loadOfficialPatterns()
