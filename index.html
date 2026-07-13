@@ -2308,6 +2308,53 @@ body.logged-in{background:#fff}
   opacity:.35;
   cursor:default;
 }
+
+.auth-name-row{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:10px;
+}
+.auth-error{
+  min-height:18px;
+  margin-top:10px;
+  color:#b3261e;
+  font-size:12px;
+  line-height:1.45;
+}
+.auth-switch,
+.auth-forgot{
+  border:0;
+  background:transparent;
+  color:#555;
+  padding:0;
+  font-size:12px;
+  text-decoration:underline;
+  text-underline-offset:3px;
+}
+.auth-switch:hover,
+.auth-switch:focus-visible,
+.auth-forgot:hover,
+.auth-forgot:focus-visible{
+  color:#111;
+  outline:0;
+}
+.auth-secondary-row{
+  margin-top:14px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:14px;
+}
+.auth-submit.busy,
+.auth-google.busy{
+  opacity:.62;
+  pointer-events:none;
+}
+@media(max-width:520px){
+  .auth-name-row{grid-template-columns:1fr}
+  .auth-secondary-row{align-items:flex-start;flex-direction:column}
+}
+
 .auth-footnote{
   margin-top:12px;
   color:#9a9a9a;
@@ -2496,7 +2543,34 @@ body.logged-in{background:#fff}
   <div class="modal" id="modal"></div>
 </div>
 
-<script>
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/12.16.0/firebase-app.js";
+import {
+  getAuth,
+  GoogleAuthProvider,
+  signInWithPopup,
+  signInWithEmailAndPassword,
+  createUserWithEmailAndPassword,
+  sendPasswordResetEmail,
+  updateProfile,
+  signOut,
+  onAuthStateChanged
+} from "https://www.gstatic.com/firebasejs/12.16.0/firebase-auth.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyDoendhzOZTLPC754TuZXxehISg5PMdjFY",
+  authDomain: "cas-101-curiosity-journal.firebaseapp.com",
+  projectId: "cas-101-curiosity-journal",
+  storageBucket: "cas-101-curiosity-journal.firebasestorage.app",
+  messagingSenderId: "931907821716",
+  appId: "1:931907821716:web:dc4140dde6398dac439481"
+};
+
+const firebaseApp = initializeApp(firebaseConfig);
+const firebaseAuth = getAuth(firebaseApp);
+const googleProvider = new GoogleAuthProvider();
+googleProvider.setCustomParameters({ prompt: "select_account" });
+
 (()=>{
 const SECTIONS=[
 {id:"intro",name:"Intro: How to Think Like a Developmentalist",age:""},
@@ -2581,7 +2655,7 @@ const defaultState={
   studentName:"",
   studentFirstName:"",
   studentLastName:"",
-  auth:{loggedIn:false,provider:"",email:"",displayName:""},
+  auth:{loggedIn:false,provider:"",email:"",displayName:"",uid:""},
   patterns:Object.fromEntries(JOURNALS.map(j=>[j.id,j.pattern])),
   journals:Object.fromEntries(JOURNALS.map(j=>[j.id,emptyJournal()]))
 };
@@ -2624,7 +2698,7 @@ function load(){
     if(!p)return structuredClone(defaultState);
     const s=structuredClone(defaultState);
     Object.assign(s,p);
-    s.auth={...defaultState.auth,...(p.auth||{})};
+    s.auth={...defaultState.auth};
     JOURNALS.forEach(j=>{
       s.journals[j.id]={...emptyJournal(),...(p.journals?.[j.id]||{})};
       s.patterns[j.id]=p.patterns?.[j.id]||j.pattern;
@@ -2708,93 +2782,213 @@ function splitNameParts(displayName="Student"){
   };
 }
 
-function completeLocalLogin({provider,email,displayName}){
-  const name=displayName?.trim()||nameFromEmail(email)||"Student";
+function applyFirebaseUser(user){
+  if(!user){
+    state.auth={...defaultState.auth};
+    state.view="home";
+    save();
+    closeProfileMenu();
+    closeDrawer();
+    closeNavSearch();
+    closeModal();
+    applyAuthShell();
+    window.scrollTo(0,0);
+    return;
+  }
+
+  const email=user.email||"";
+  const name=(user.displayName||nameFromEmail(email)||"Student").trim();
   const parts=splitNameParts(name);
-  state.auth={loggedIn:true,provider,email:email||"",displayName:name};
+
+  state.auth={
+    loggedIn:true,
+    provider:user.providerData?.[0]?.providerId||"firebase",
+    email,
+    displayName:name,
+    uid:user.uid
+  };
+
   if(!state.studentFirstName)state.studentFirstName=parts.first;
   if(!state.studentLastName && parts.last)state.studentLastName=parts.last;
-  state.view="home";
+  state.view=state.view==="coverEdit"||state.view==="intro"||state.view==="entry"?state.view:"home";
+
   save();
   closeModal();
   applyAuthShell();
   render();
-  window.scrollTo(0,0);
 }
 
-function signOutLocal(){
-  state.auth={...defaultState.auth};
-  state.view="home";
-  save();
-  closeProfileMenu();
-  closeDrawer();
-  closeNavSearch();
-  closeModal();
-  applyAuthShell();
-  window.scrollTo(0,0);
+async function signOutFirebase(){
+  try{
+    await signOut(firebaseAuth);
+  }catch(error){
+    console.error(error);
+    showToast("Unable to log out. Please try again.");
+  }
 }
 
-function openAuthModal(){
-  modal.className="modal auth-modal";
-  modal.innerHTML=`<button class="modal-close close-icon" data-close aria-label="Close">
-      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"></path></svg>
-    </button>
-    <h2>Login</h2>
-    <p>Use the options below to try the sign-in flow locally before we connect Firebase.</p>
+function authMessage(error){
+  const code=error?.code||"";
+  const messages={
+    "auth/invalid-credential":"The email or password is incorrect.",
+    "auth/invalid-email":"Enter a valid email address.",
+    "auth/email-already-in-use":"An account already exists for this email.",
+    "auth/weak-password":"Use a password with at least six characters.",
+    "auth/popup-closed-by-user":"The Google sign-in window was closed.",
+    "auth/popup-blocked":"Your browser blocked the Google sign-in window.",
+    "auth/network-request-failed":"Check your internet connection and try again.",
+    "auth/too-many-requests":"Too many attempts. Please wait and try again.",
+    "auth/user-disabled":"This account has been disabled."
+  };
+  return messages[code]||"Something went wrong. Please try again.";
+}
 
-    <button class="auth-google" id="continueWithGoogle">
-      <svg viewBox="0 0 24 24" aria-hidden="true">
-        <path fill="#EA4335" d="M12.24 10.285v3.821h5.445c-.24 1.544-1.857 4.528-5.445 4.528-3.276 0-5.948-2.712-5.948-6.057 0-3.345 2.672-6.057 5.948-6.057 1.864 0 3.112.795 3.826 1.479l2.605-2.534C17.01 3.91 14.86 3 12.24 3 7.17 3 3.06 7.163 3.06 12.577c0 5.414 4.11 9.577 9.18 9.577 5.3 0 8.82-3.725 8.82-8.98 0-.603-.066-1.062-.147-1.52H12.24Z"/>
-        <path fill="#34A853" d="M3.06 7.443 6.2 9.744C7.05 7.977 8.49 6.52 12.24 6.52c1.864 0 3.112.795 3.826 1.479l2.605-2.534C17.01 3.91 14.86 3 12.24 3 8.713 3 5.631 4.996 4.13 7.905l-1.07-.462Z"/>
-        <path fill="#4A90E2" d="M12.24 22.154c2.55 0 4.693-.844 6.257-2.3l-2.89-2.38c-.774.542-1.804.922-3.367.922-3.573 0-5.235-2.92-5.432-4.405l-3.116 2.4c1.485 2.952 4.58 5.763 8.548 5.763Z"/>
-        <path fill="#FBBC05" d="M6.808 13.99a6.703 6.703 0 0 1-.316-2.035c0-.706.115-1.389.301-2.035L3.677 7.52A9.699 9.699 0 0 0 3.06 12.577c0 1.77.43 3.444 1.186 4.924l2.562-1.983Z"/>
-      </svg>
-      <span>Continue with Google</span>
-    </button>
+function openAuthModal(initialMode="login"){
+  let mode=initialMode;
 
-    <div class="auth-divider">or</div>
+  const paint=()=>{
+    const creating=mode==="create";
 
-    <div class="auth-stack">
-      <input class="field" id="authEmail" type="email" autocomplete="email" placeholder="Email address">
-      <input class="field" id="authPassword" type="password" autocomplete="current-password" placeholder="Password">
-      <button class="auth-submit" id="emailSignIn" disabled>Continue with email</button>
-    </div>
+    modal.className="modal auth-modal";
+    modal.innerHTML=`<button class="modal-close close-icon" data-close aria-label="Close">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"></path></svg>
+      </button>
+      <h2>${creating?"Create account":"Login"}</h2>
+      <p>${creating
+        ?"Create an account so your journal can be connected to you."
+        :"Sign in to open your Curiosity Journal."}</p>
 
-    <div class="auth-footnote">For local testing only, both options create a session in this browser without contacting a real auth provider.</div>`;
+      <button class="auth-google" id="continueWithGoogle">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path fill="#EA4335" d="M12.24 10.285v3.821h5.445c-.24 1.544-1.857 4.528-5.445 4.528-3.276 0-5.948-2.712-5.948-6.057 0-3.345 2.672-6.057 5.948-6.057 1.864 0 3.112.795 3.826 1.479l2.605-2.534C17.01 3.91 14.86 3 12.24 3 7.17 3 3.06 7.163 3.06 12.577c0 5.414 4.11 9.577 9.18 9.577 5.3 0 8.82-3.725 8.82-8.98 0-.603-.066-1.062-.147-1.52H12.24Z"/>
+          <path fill="#34A853" d="M3.06 7.443 6.2 9.744C7.05 7.977 8.49 6.52 12.24 6.52c1.864 0 3.112.795 3.826 1.479l2.605-2.534C17.01 3.91 14.86 3 12.24 3 8.713 3 5.631 4.996 4.13 7.905l-1.07-.462Z"/>
+          <path fill="#4A90E2" d="M12.24 22.154c2.55 0 4.693-.844 6.257-2.3l-2.89-2.38c-.774.542-1.804.922-3.367.922-3.573 0-5.235-2.92-5.432-4.405l-3.116 2.4c1.485 2.952 4.58 5.763 8.548 5.763Z"/>
+          <path fill="#FBBC05" d="M6.808 13.99a6.703 6.703 0 0 1-.316-2.035c0-.706.115-1.389.301-2.035L3.677 7.52A9.699 9.699 0 0 0 3.06 12.577c0 1.77.43 3.444 1.186 4.924l2.562-1.983Z"/>
+        </svg>
+        <span>Continue with Google</span>
+      </button>
 
+      <div class="auth-divider">or</div>
+
+      <form class="auth-stack" id="emailAuthForm">
+        ${creating?`<div class="auth-name-row">
+          <input class="field" id="authFirstName" type="text" autocomplete="given-name" placeholder="First name">
+          <input class="field" id="authLastName" type="text" autocomplete="family-name" placeholder="Last name">
+        </div>`:""}
+        <input class="field" id="authEmail" type="email" autocomplete="email" placeholder="Email address">
+        <input class="field" id="authPassword" type="password" autocomplete="${creating?"new-password":"current-password"}" placeholder="Password">
+        <button class="auth-submit" id="emailSignIn" type="submit" disabled>${creating?"Create account":"Login"}</button>
+      </form>
+
+      <div class="auth-error" id="authError" role="alert" aria-live="polite"></div>
+
+      <div class="auth-secondary-row">
+        ${creating
+          ?`<span class="auth-footnote">Already have an account? <button class="auth-switch" id="authSwitch">Log in</button></span>`
+          :`<button class="auth-forgot" id="forgotPassword">Forgot password?</button>
+             <span class="auth-footnote">New here? <button class="auth-switch" id="authSwitch">Create an account</button></span>`}
+      </div>`;
+
+    modal.querySelectorAll("[data-close]").forEach(button=>button.onclick=closeModal);
+
+    const emailInput=document.getElementById("authEmail");
+    const passwordInput=document.getElementById("authPassword");
+    const firstInput=document.getElementById("authFirstName");
+    const lastInput=document.getElementById("authLastName");
+    const emailButton=document.getElementById("emailSignIn");
+    const googleButton=document.getElementById("continueWithGoogle");
+    const errorBox=document.getElementById("authError");
+    const form=document.getElementById("emailAuthForm");
+
+    const setBusy=(busy)=>{
+      emailButton.classList.toggle("busy",busy);
+      googleButton.classList.toggle("busy",busy);
+      emailButton.disabled=busy||!formIsReady();
+      [...form.elements].forEach(element=>element.disabled=busy);
+      document.getElementById("authSwitch").disabled=busy;
+      const forgot=document.getElementById("forgotPassword");
+      if(forgot)forgot.disabled=busy;
+    };
+
+    const formIsReady=()=>{
+      const basics=emailInput.value.trim()&&passwordInput.value.length>=6;
+      return creating?Boolean(basics&&firstInput.value.trim()&&lastInput.value.trim()):Boolean(basics);
+    };
+
+    const syncButton=()=>{
+      emailButton.disabled=!formIsReady();
+      errorBox.textContent="";
+    };
+
+    [emailInput,passwordInput,firstInput,lastInput].filter(Boolean)
+      .forEach(input=>input.addEventListener("input",syncButton));
+    syncButton();
+
+    googleButton.onclick=async()=>{
+      errorBox.textContent="";
+      setBusy(true);
+      try{
+        await signInWithPopup(firebaseAuth,googleProvider);
+      }catch(error){
+        errorBox.textContent=authMessage(error);
+        setBusy(false);
+      }
+    };
+
+    form.onsubmit=async event=>{
+      event.preventDefault();
+      if(!formIsReady())return;
+      errorBox.textContent="";
+      setBusy(true);
+
+      const email=emailInput.value.trim();
+      const password=passwordInput.value;
+
+      try{
+        if(creating){
+          const credential=await createUserWithEmailAndPassword(firebaseAuth,email,password);
+          const displayName=`${firstInput.value.trim()} ${lastInput.value.trim()}`.trim();
+          await updateProfile(credential.user,{displayName});
+          await credential.user.reload();
+          applyFirebaseUser(firebaseAuth.currentUser);
+        }else{
+          await signInWithEmailAndPassword(firebaseAuth,email,password);
+        }
+      }catch(error){
+        errorBox.textContent=authMessage(error);
+        setBusy(false);
+      }
+    };
+
+    document.getElementById("authSwitch").onclick=()=>{
+      mode=creating?"login":"create";
+      paint();
+    };
+
+    const forgot=document.getElementById("forgotPassword");
+    if(forgot){
+      forgot.onclick=async()=>{
+        const email=emailInput.value.trim();
+        if(!email){
+          errorBox.textContent="Enter your email address first.";
+          emailInput.focus();
+          return;
+        }
+        try{
+          await sendPasswordResetEmail(firebaseAuth,email);
+          errorBox.style.color="#277a38";
+          errorBox.textContent="Password reset email sent.";
+        }catch(error){
+          errorBox.style.color="";
+          errorBox.textContent=authMessage(error);
+        }
+      };
+    }
+  };
+
+  paint();
   openModal();
-
-  const emailInput=document.getElementById("authEmail");
-  const passwordInput=document.getElementById("authPassword");
-  const emailButton=document.getElementById("emailSignIn");
-
-  const syncEmailButton=()=>{
-    emailButton.disabled=!(emailInput.value.trim()&&passwordInput.value.trim());
-  };
-
-  emailInput.addEventListener("input",syncEmailButton);
-  passwordInput.addEventListener("input",syncEmailButton);
-  syncEmailButton();
-
-  document.getElementById("continueWithGoogle").onclick=()=>{
-    completeLocalLogin({
-      provider:"google",
-      email:"student@example.com",
-      displayName:state.auth?.displayName||"Student"
-    });
-  };
-
-  emailButton.onclick=()=>{
-    const email=emailInput.value.trim();
-    if(!email||!passwordInput.value.trim())return;
-    completeLocalLogin({
-      provider:"email",
-      email,
-      displayName:nameFromEmail(email)
-    });
-  };
 }
-
 let landingDemoTimer=null;
 
 function setLandingDemoFrame(){}
@@ -4283,7 +4477,7 @@ profileButton.onclick=event=>{
   else openProfileMenu();
 };
 
-profileSignOut.onclick=signOutLocal;
+profileSignOut.onclick=signOutFirebase;
 
 document.getElementById("courseHome").onclick=()=>{
   closeNavSearch();
@@ -4329,10 +4523,18 @@ window.addEventListener("keydown",e=>{if(e.key==="Escape"){closeModal();closeDra
 if(DEMO_MODE){
   resetDemoJournal();
   document.body.classList.add("demo-mode");
+  applyAuthShell();
+  startLandingDemo();
+  render();
+}else{
+  state.auth={...defaultState.auth};
+  applyAuthShell();
+
+  onAuthStateChanged(firebaseAuth,user=>{
+    applyFirebaseUser(user);
+  });
 }
-applyAuthShell();
-startLandingDemo();
-render();
+
 loadOfficialPatterns()
   .then(()=>{render();})
   .catch(()=>{});
