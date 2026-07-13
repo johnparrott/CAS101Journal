@@ -1734,7 +1734,13 @@ background-color:#78a99d;background-size:28px 49px;background-position:0 0,0 0,1
 .cloud-sync-status.error{color:#8f2f27}
 .cloud-sync-status.offline{color:#777}
 @media(max-width:560px){
-  .cloud-sync-status{display:none}
+  .cloud-sync-status{
+    display:block;
+    min-width:auto;
+    max-width:72px;
+    overflow:hidden;
+    text-overflow:ellipsis;
+  }
 }
 
 .profile-menu-wrap{
@@ -2579,7 +2585,7 @@ import {
   getFirestore,
   doc,
   collection,
-  getDocs,
+  getDocsFromServer,
   setDoc,
   serverTimestamp
 } from "https://www.gstatic.com/firebasejs/12.16.0/firebase-firestore.js";
@@ -2759,7 +2765,7 @@ function setCloudStatus(message="",kind=""){
   cloudSyncStatus.textContent=message;
   cloudSyncStatus.className=`cloud-sync-status${message?" visible":""}${kind?` ${kind}`:""}`;
   clearTimeout(cloudStatusTimer);
-  if(message==="Saved"){
+  if(message==="Saved to cloud"){
     cloudStatusTimer=setTimeout(()=>{
       cloudSyncStatus.classList.remove("visible");
     },1800);
@@ -2827,13 +2833,13 @@ async function syncAllChangedJournals(){
     });
 
     await Promise.all(writes);
-    setCloudStatus("Saved");
+    setCloudStatus("Saved to cloud");
   }catch(error){
     console.error("Firestore save failed",error);
     setCloudStatus(navigator.onLine?"Not saved":"Offline",navigator.onLine?"error":"offline");
   }
 }
-function scheduleCloudSync(delay=850){
+function scheduleCloudSync(delay=300){
   if(!cloudReady||!firebaseAuth.currentUser)return;
   clearTimeout(cloudSyncTimer);
   setCloudStatus(navigator.onLine?"Saving…":"Offline",navigator.onLine?"":"offline");
@@ -2963,7 +2969,7 @@ async function applyFirebaseUser(user){
   setCloudStatus("Loading…");
 
   try{
-    const snapshot=await getDocs(collection(firestoreDb,"users",user.uid,"journals"));
+    const snapshot=await getDocsFromServer(collection(firestoreDb,"users",user.uid,"journals"));
 
     if(!snapshot.empty){
       snapshot.forEach(documentSnapshot=>{
@@ -3001,7 +3007,7 @@ async function applyFirebaseUser(user){
     if(snapshot.empty){
       await syncAllChangedJournals();
     }else{
-      setCloudStatus("Saved");
+      setCloudStatus("Saved to cloud");
     }
   }catch(error){
     console.error("Firestore load failed",error);
@@ -4734,7 +4740,58 @@ window.addEventListener("offline",()=>{
 window.addEventListener("online",()=>{
   if(isLoggedIn()){
     setCloudStatus("Saving…");
-    scheduleCloudSync(150);
+    scheduleCloudSync(100);
+  }
+});
+document.addEventListener("visibilitychange",()=>{
+  if(!isLoggedIn())return;
+  if(document.visibilityState==="hidden"){
+    clearTimeout(cloudSyncTimer);
+    syncAllChangedJournals();
+  }
+});
+window.addEventListener("focus",async()=>{
+  const user=firebaseAuth.currentUser;
+  if(!user||!cloudReady||!navigator.onLine)return;
+  try{
+    const snapshot=await getDocsFromServer(collection(firestoreDb,"users",user.uid,"journals"));
+    let changed=false;
+    snapshot.forEach(documentSnapshot=>{
+      const data=documentSnapshot.data()||{};
+      const journalId=documentSnapshot.id;
+      if(!state.journals[journalId])return;
+
+      const remoteUpdated=Number(data.clientUpdatedAt)||0;
+      const localUpdated=Number(state.journals[journalId].updatedAt)||0;
+      if(remoteUpdated<=localUpdated)return;
+
+      state.journals[journalId]={
+        ...emptyJournal(),
+        introSeen:Boolean(data.introSeen),
+        question:data.question||"",
+        sources:Array.isArray(data.sources)?data.sources:[],
+        answer:data.answer||"",
+        complete:Boolean(data.complete),
+        updatedAt:remoteUpdated
+      };
+      if(data.pattern)state.patterns[journalId]=data.pattern;
+      cloudFingerprints.set(journalId,journalFingerprint({
+        introSeen:Boolean(data.introSeen),
+        question:data.question||"",
+        sources:Array.isArray(data.sources)?data.sources:[],
+        answer:data.answer||"",
+        complete:Boolean(data.complete),
+        pattern:data.pattern||state.patterns[journalId]
+      }));
+      changed=true;
+    });
+    if(changed){
+      saveLocalOnly();
+      render();
+      setCloudStatus("Updated");
+    }
+  }catch(error){
+    console.error("Firestore refresh failed",error);
   }
 });
 
