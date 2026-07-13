@@ -1719,6 +1719,24 @@ background-color:#78a99d;background-size:28px 49px;background-position:0 0,0 0,1
 }
 
 
+.cloud-sync-status{
+  min-width:58px;
+  color:#8a8a8a;
+  font-size:11px;
+  line-height:1;
+  text-align:right;
+  white-space:nowrap;
+  opacity:0;
+  transform:translateY(1px);
+  transition:opacity .18s ease,color .18s ease;
+}
+.cloud-sync-status.visible{opacity:1}
+.cloud-sync-status.error{color:#8f2f27}
+.cloud-sync-status.offline{color:#777}
+@media(max-width:560px){
+  .cloud-sync-status{display:none}
+}
+
 .profile-menu-wrap{
   position:relative;
   display:flex;
@@ -2504,6 +2522,7 @@ body.logged-in{background:#fff}
         <span class="save-home-tooltip" role="tooltip">Save your work and return home</span>
       </button>
 
+      <span class="cloud-sync-status" id="cloudSyncStatus" aria-live="polite"></span>
       <div class="profile-menu-wrap" id="profileMenuWrap">
         <button class="profile-button" id="profileButton" aria-label="Open profile menu" aria-expanded="false">
           <span class="profile-avatar" id="profileAvatar">S</span>
@@ -2556,6 +2575,14 @@ import {
   signOut,
   onAuthStateChanged
 } from "https://www.gstatic.com/firebasejs/12.16.0/firebase-auth.js";
+import {
+  getFirestore,
+  doc,
+  collection,
+  getDocs,
+  setDoc,
+  serverTimestamp
+} from "https://www.gstatic.com/firebasejs/12.16.0/firebase-firestore.js";
 
 const firebaseConfig = {
   apiKey: "AIzaSyDoendhzOZTLPC754TuZXxehISg5PMdjFY",
@@ -2568,6 +2595,7 @@ const firebaseConfig = {
 
 const firebaseApp = initializeApp(firebaseConfig);
 const firebaseAuth = getAuth(firebaseApp);
+const firestoreDb = getFirestore(firebaseApp);
 const googleProvider = new GoogleAuthProvider();
 googleProvider.setCustomParameters({ prompt: "select_account" });
 
@@ -2676,6 +2704,7 @@ const navSearch=document.getElementById("navSearch");
 const searchCloseBtn=document.getElementById("searchCloseBtn");
 const journalSearchInput=document.getElementById("journalSearchInput");
 const navSearchResults=document.getElementById("navSearchResults");
+const cloudSyncStatus=document.getElementById("cloudSyncStatus");
 const profileMenuWrap=document.getElementById("profileMenuWrap");
 const profileButton=document.getElementById("profileButton");
 const profileMenu=document.getElementById("profileMenu");
@@ -2692,22 +2721,127 @@ const modalLayer=document.getElementById("modalLayer");
 const modal=document.getElementById("modal");
 const toast=document.getElementById("toast");
 
-function load(){
+function hydrateState(payload){
+  const s=structuredClone(defaultState);
+  if(!payload)return s;
+  Object.assign(s,payload);
+  s.auth={...defaultState.auth};
+  JOURNALS.forEach(j=>{
+    s.journals[j.id]={...emptyJournal(),...(payload.journals?.[j.id]||{})};
+    s.patterns[j.id]=payload.patterns?.[j.id]||j.pattern;
+  });
+  return s;
+}
+function readLocalState(key=STORAGE){
   try{
-    const p=JSON.parse(localStorage.getItem(STORAGE)||"null");
-    if(!p)return structuredClone(defaultState);
-    const s=structuredClone(defaultState);
-    Object.assign(s,p);
-    s.auth={...defaultState.auth};
-    JOURNALS.forEach(j=>{
-      s.journals[j.id]={...emptyJournal(),...(p.journals?.[j.id]||{})};
-      s.patterns[j.id]=p.patterns?.[j.id]||j.pattern;
+    return hydrateState(JSON.parse(localStorage.getItem(key)||"null"));
+  }catch{
+    return structuredClone(defaultState);
+  }
+}
+function load(){
+  return readLocalState(STORAGE);
+}
+function userStorageKey(uid){
+  return `${STORAGE}:user:${uid}`;
+}
+function saveLocalOnly(){
+  const key=isLoggedIn()&&state.auth.uid?userStorageKey(state.auth.uid):STORAGE;
+  localStorage.setItem(key,JSON.stringify(state));
+}
+let cloudReady=false;
+let cloudSyncTimer=null;
+let cloudStatusTimer=null;
+let cloudFingerprints=new Map();
+
+function setCloudStatus(message="",kind=""){
+  if(!cloudSyncStatus)return;
+  cloudSyncStatus.textContent=message;
+  cloudSyncStatus.className=`cloud-sync-status${message?" visible":""}${kind?` ${kind}`:""}`;
+  clearTimeout(cloudStatusTimer);
+  if(message==="Saved"){
+    cloudStatusTimer=setTimeout(()=>{
+      cloudSyncStatus.classList.remove("visible");
+    },1800);
+  }
+}
+function journalCloudPayload(journalId){
+  const js=state.journals[journalId]||emptyJournal();
+  return {
+    introSeen:Boolean(js.introSeen),
+    question:js.question||"",
+    sources:Array.isArray(js.sources)?js.sources:[],
+    answer:js.answer||"",
+    complete:Boolean(js.complete),
+    pattern:state.patterns[journalId]||JOURNALS.find(j=>j.id===journalId)?.pattern||"pattern-1",
+    clientUpdatedAt:Number(js.updatedAt)||Date.now()
+  };
+}
+function journalFingerprint(payload){
+  return JSON.stringify({
+    introSeen:payload.introSeen,
+    question:payload.question,
+    sources:payload.sources,
+    answer:payload.answer,
+    complete:payload.complete,
+    pattern:payload.pattern
+  });
+}
+async function writeProfileToCloud(user){
+  const name=(user.displayName||state.auth.displayName||nameFromEmail(user.email||"")||"Student").trim();
+  const parts=splitNameParts(name);
+  await setDoc(doc(firestoreDb,"users",user.uid),{
+    email:user.email||"",
+    displayName:name,
+    firstName:state.studentFirstName||parts.first||"",
+    lastName:state.studentLastName||parts.last||"",
+    updatedAt:serverTimestamp()
+  },{merge:true});
+}
+async function syncAllChangedJournals(){
+  const user=firebaseAuth.currentUser;
+  if(!user||!cloudReady)return;
+  if(!navigator.onLine){
+    setCloudStatus("Offline","offline");
+    return;
+  }
+
+  setCloudStatus("Saving…");
+  try{
+    await writeProfileToCloud(user);
+    const writes=[];
+
+    JOURNALS.forEach(journal=>{
+      const payload=journalCloudPayload(journal.id);
+      const fingerprint=journalFingerprint(payload);
+      if(cloudFingerprints.get(journal.id)===fingerprint)return;
+
+      writes.push(
+        setDoc(doc(firestoreDb,"users",user.uid,"journals",journal.id),{
+          ...payload,
+          updatedAt:serverTimestamp()
+        },{merge:true}).then(()=>{
+          cloudFingerprints.set(journal.id,fingerprint);
+        })
+      );
     });
-    return s;
-  }catch{return structuredClone(defaultState)}
+
+    await Promise.all(writes);
+    setCloudStatus("Saved");
+  }catch(error){
+    console.error("Firestore save failed",error);
+    setCloudStatus(navigator.onLine?"Not saved":"Offline",navigator.onLine?"error":"offline");
+  }
+}
+function scheduleCloudSync(delay=850){
+  if(!cloudReady||!firebaseAuth.currentUser)return;
+  clearTimeout(cloudSyncTimer);
+  setCloudStatus(navigator.onLine?"Saving…":"Offline",navigator.onLine?"":"offline");
+  cloudSyncTimer=setTimeout(syncAllChangedJournals,delay);
 }
 function save(){
-  localStorage.setItem(STORAGE,JSON.stringify(state));
+  saveLocalOnly();
+  scheduleCloudSync();
 }
 function touch(js){js.updatedAt=Date.now();js.complete=false;save()}
 function esc(s=""){return String(s).replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]))}
@@ -2782,16 +2916,23 @@ function splitNameParts(displayName="Student"){
   };
 }
 
-function applyFirebaseUser(user){
+async function applyFirebaseUser(user){
+  clearTimeout(cloudSyncTimer);
+  cloudReady=false;
+  cloudFingerprints.clear();
+
   if(!user){
+    state=readLocalState(STORAGE);
     state.auth={...defaultState.auth};
     state.view="home";
-    save();
+    saveLocalOnly();
     closeProfileMenu();
     closeDrawer();
     closeNavSearch();
     closeModal();
+    setCloudStatus("");
     applyAuthShell();
+    render();
     window.scrollTo(0,0);
     return;
   }
@@ -2799,7 +2940,11 @@ function applyFirebaseUser(user){
   const email=user.email||"";
   const name=(user.displayName||nameFromEmail(email)||"Student").trim();
   const parts=splitNameParts(name);
+  const userKey=userStorageKey(user.uid);
+  const hasUserBackup=Boolean(localStorage.getItem(userKey));
+  const localCandidate=hasUserBackup?readLocalState(userKey):state;
 
+  state=hydrateState(localCandidate);
   state.auth={
     loggedIn:true,
     provider:user.providerData?.[0]?.providerId||"firebase",
@@ -2809,17 +2954,65 @@ function applyFirebaseUser(user){
   };
 
   if(!state.studentFirstName)state.studentFirstName=parts.first;
-  if(!state.studentLastName && parts.last)state.studentLastName=parts.last;
+  if(!state.studentLastName&&parts.last)state.studentLastName=parts.last;
   state.view=state.view==="coverEdit"||state.view==="intro"||state.view==="entry"?state.view:"home";
 
-  save();
-  closeModal();
+  saveLocalOnly();
   applyAuthShell();
   render();
-}
+  setCloudStatus("Loading…");
 
+  try{
+    const snapshot=await getDocs(collection(firestoreDb,"users",user.uid,"journals"));
+
+    if(!snapshot.empty){
+      snapshot.forEach(documentSnapshot=>{
+        const data=documentSnapshot.data()||{};
+        const journalId=documentSnapshot.id;
+        if(!state.journals[journalId])return;
+
+        state.journals[journalId]={
+          ...emptyJournal(),
+          introSeen:Boolean(data.introSeen),
+          question:data.question||"",
+          sources:Array.isArray(data.sources)?data.sources:[],
+          answer:data.answer||"",
+          complete:Boolean(data.complete),
+          updatedAt:Number(data.clientUpdatedAt)||Date.now()
+        };
+        if(data.pattern)state.patterns[journalId]=data.pattern;
+
+        cloudFingerprints.set(journalId,journalFingerprint({
+          introSeen:Boolean(data.introSeen),
+          question:data.question||"",
+          sources:Array.isArray(data.sources)?data.sources:[],
+          answer:data.answer||"",
+          complete:Boolean(data.complete),
+          pattern:data.pattern||state.patterns[journalId]
+        }));
+      });
+    }
+
+    await writeProfileToCloud(user);
+    cloudReady=true;
+    saveLocalOnly();
+    render();
+
+    if(snapshot.empty){
+      await syncAllChangedJournals();
+    }else{
+      setCloudStatus("Saved");
+    }
+  }catch(error){
+    console.error("Firestore load failed",error);
+    cloudReady=true;
+    setCloudStatus(navigator.onLine?"Cloud unavailable":"Offline",navigator.onLine?"error":"offline");
+  }
+}
 async function signOutFirebase(){
   try{
+    clearTimeout(cloudSyncTimer);
+    await syncAllChangedJournals();
     await signOut(firebaseAuth);
   }catch(error){
     console.error(error);
@@ -4530,10 +4723,20 @@ if(DEMO_MODE){
   state.auth={...defaultState.auth};
   applyAuthShell();
 
-  onAuthStateChanged(firebaseAuth,user=>{
-    applyFirebaseUser(user);
+  onAuthStateChanged(firebaseAuth,async user=>{
+    await applyFirebaseUser(user);
   });
 }
+
+window.addEventListener("offline",()=>{
+  if(isLoggedIn())setCloudStatus("Offline","offline");
+});
+window.addEventListener("online",()=>{
+  if(isLoggedIn()){
+    setCloudStatus("Saving…");
+    scheduleCloudSync(150);
+  }
+});
 
 loadOfficialPatterns()
   .then(()=>{render();})
