@@ -3179,6 +3179,7 @@ function openAuthModal(initialMode="login"){
       setBusy(true);
       try{
         await signInWithPopup(firebaseAuth,googleProvider);
+        closeModal();
       }catch(error){
         errorBox.textContent=authMessage(error);
         setBusy(false);
@@ -3200,9 +3201,11 @@ function openAuthModal(initialMode="login"){
           const displayName=`${firstInput.value.trim()} ${lastInput.value.trim()}`.trim();
           await updateProfile(credential.user,{displayName});
           await credential.user.reload();
-          applyFirebaseUser(firebaseAuth.currentUser);
+          await applyFirebaseUser(firebaseAuth.currentUser);
+          closeModal();
         }else{
           await signInWithEmailAndPassword(firebaseAuth,email,password);
+          closeModal();
         }
       }catch(error){
         errorBox.textContent=authMessage(error);
